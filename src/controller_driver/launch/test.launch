@@ -1,0 +1,7 @@
+<launch>
+    
+    <node name="multi_action_server" pkg="controller_driver" type="multi_action_server.py" output="screen">
+        <param name="config_file" value="$(find controller_driver)/config/arm_bind.yaml" />
+        </node>
+
+</launch>

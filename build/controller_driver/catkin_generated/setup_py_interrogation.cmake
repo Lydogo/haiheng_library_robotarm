@@ -1,0 +1,7 @@
+set(controller_driver_SETUP_PY_SETUP_MODULE "distutils.core")
+set(controller_driver_SETUP_PY_VERSION "0.0.0")
+set(controller_driver_SETUP_PY_SCRIPTS "")
+set(controller_driver_SETUP_PY_PACKAGES "motor_driver_pkg")
+set(controller_driver_SETUP_PY_PACKAGE_DIRS "src/motor_driver_pkg")
+set(controller_driver_SETUP_PY_MODULES "")
+set(controller_driver_SETUP_PY_MODULE_DIRS "")

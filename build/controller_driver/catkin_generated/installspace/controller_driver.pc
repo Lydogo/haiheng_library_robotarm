@@ -1,0 +1,8 @@
+prefix=/root/haiheng2_ws/install
+
+Name: controller_driver
+Description: Description of controller_driver
+Version: 0.0.0
+Cflags: -I${prefix}/include
+Libs: -L${prefix}/lib 
+Requires: actionlib roscpp rosmsg rospy actionlib_msgs
