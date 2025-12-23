@@ -1,2 +1,0 @@
-controller_driver:haiheng-URDF:haiheng_moveit_config
--DCATKIN_DEVEL_PREFIX=/root/haiheng2_ws/devel -DCMAKE_INSTALL_PREFIX=/root/haiheng2_ws/install -G Unix Makefiles
