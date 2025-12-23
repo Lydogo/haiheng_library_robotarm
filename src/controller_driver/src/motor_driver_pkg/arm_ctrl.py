@@ -37,6 +37,7 @@ class ArmController:
         self.baud_rate = baud_rate
         self.auto_enable = auto_enable
         self.can_handlers = {}
+        self.can_locks = {}  # per-device CAN锁
         self.motors = {}
         self.motor_id_list = []
         self.joint_names_list = []
@@ -58,6 +59,7 @@ class ArmController:
             print(f"Brake-on-arrival enabled for motors: {sorted(list(self.brake_motor_ids))}") # 输出排序后的刹车电机ID列表 
 
         self.joint_name_to_motor_id = dict(zip(self.joint_names_list, self.motor_id_list))
+        self.motor_reduction_ratios = {}  # motor_id -> reduction_ratio
 
         self._initialize_can_and_motors()
 
@@ -100,6 +102,7 @@ class ArmController:
                     can = CanbusHandler(can_channel=self.can_channel, baud_rate=self.baud_rate, device_index=dev_idx)
                     can.open()
                     self.can_handlers[dev_idx] = can
+                    self.can_locks[dev_idx] = threading.Lock()
                     print(f"CAN device {dev_idx} opened on channel {self.can_channel} @ {self.baud_rate}kbps.")
 
                 can_handler = self.can_handlers[dev_idx]
@@ -114,6 +117,10 @@ class ArmController:
                     else:
                         print(f"  Motor {motor_id} initialized (NOT enabled).")
                     self.motors[motor_id].clear_errors()
+                    # 读取减速比，失败则使用默认值101
+                    ratio = self.motors[motor_id].get_reduction_ratio()
+                    self.motor_reduction_ratios[motor_id] = ratio if ratio else 101
+                    print(f"  Motor {motor_id} reduction ratio: {self.motor_reduction_ratios[motor_id]}")
 
             #这里单独对腿部的三个电机进行初始化
             matcher=self.ARM_CONFIG["legs"]['uuid_matcher']
@@ -135,6 +142,7 @@ class ArmController:
                 can = CanbusHandler(can_channel=self.can_channel, baud_rate=self.baud_rate, device_index=dev_idx)
                 can.open()
                 self.can_handlers[dev_idx] = can
+                self.can_locks[dev_idx] = threading.Lock()
                 print(f"CAN device {dev_idx} opened on channel {self.can_channel} @ {self.baud_rate}kbps.")
             can_handler = self.can_handlers[dev_idx]
             for motor_id in motor_ids:
@@ -147,8 +155,10 @@ class ArmController:
                 else:
                     print(f"  Motor {motor_id} initialized (NOT enabled).")
                 self.motors[motor_id].clear_errors()
-
-
+                # 读取减速比，失败则使用默认值101
+                ratio = self.motors[motor_id].get_reduction_ratio()
+                self.motor_reduction_ratios[motor_id] = ratio if ratio else 101
+                print(f"  Motor {motor_id} reduction ratio: {self.motor_reduction_ratios[motor_id]}")
 
 
         except IOError as e:
@@ -158,28 +168,90 @@ class ArmController:
             print(f"\nAn unexpected error occurred during initialization: {e}")
             raise
 
+    def get_all_motor_states(self, motor_ids=None):
+        """
+        批量获取电机状态（电流、速度、位置），使用0x41指令一次获取。
+        返回: {motor_id: {'current_ma': int, 'speed_001hz': int, 'position_cnt': int}, ...}
+        """
+        if motor_ids is None:
+            motor_ids = self.motor_id_list
+        try:
+            states = {}
+            commands_by_device = self._group_motors_by_device(motor_ids)
+
+            def task_for_device(dev_idx, m_ids):
+                with self.can_locks[dev_idx]:
+                    for motor_id in m_ids:
+                        state = self.motors[motor_id].get_all_states()
+                        states[motor_id] = state
+
+            with ThreadPoolExecutor(max_workers=len(self.can_handlers) or 1) as executor:
+                futures = [executor.submit(task_for_device, dev_idx, m_ids) for dev_idx, m_ids in commands_by_device.items() if m_ids]
+                for future in futures: future.result()
+            return states
+        except Exception as e:
+            print(f"\n获取电机状态过程中发生错误: {e}")
+            return {}
+
     def get_target_positions(self):
         """
-        Retrieves the current target positions of all motors in motor_id_list.
+        Retrieves the current positions of all motors in motor_id_list.
         Returns a list of positions corresponding to motor_id_list order.
         """
         try:
-            positions = {}
-            commands_by_device = self._group_motors_by_device(self.motor_id_list)### 按照设备分组电机 ###
-
-            def task_for_device(motor_ids):
-                for motor_id in motor_ids:
-                    positions[motor_id] = self.motors[motor_id].get_current_position()
-                    #print(f"  Motor {motor_id} current position: {positions[motor_id]}")
-
-            with ThreadPoolExecutor(max_workers=len(self.can_handlers) or 1) as executor:
-                ### 并行获取每个设备上的电机位置 ###
-                futures = [executor.submit(task_for_device, m_ids) for _, m_ids in commands_by_device.items() if m_ids]
-                for future in futures: future.result()
-            return [positions.get(motor_id) for motor_id in self.motor_id_list]#### 按照 motor_id_list 顺序返回位置列表 其实并不影响####
+            states = self.get_all_motor_states()
+            positions = []
+            for motor_id in self.motor_id_list:
+                state = states.get(motor_id)
+                if state:
+                    positions.append(state.get('position_cnt'))
+                else:
+                    positions.append(None)
+            return positions
         except Exception as e:
             print(f"\n获取目标位置过程中发生错误: {e}")
             raise
+
+    def get_motor_diagnostics(self, motor_ids=None):
+        """
+        获取电机的电流（从缓存的状态中提取）。
+        返回: {motor_id: {'current_ma': int, 'error_status': int}, ...}
+        """
+        states = self.get_all_motor_states(motor_ids)
+        diagnostics = {}
+        for motor_id, state in states.items():
+            if state:
+                diagnostics[motor_id] = {
+                    'current_ma': state.get('current_ma'),
+                    'error_status': None  # 0x41不返回错误码，需要时单独读取
+                }
+            else:
+                diagnostics[motor_id] = {'current_ma': None, 'error_status': None}
+        return diagnostics
+
+    def get_error_statuses(self, motor_ids=None):
+        """
+        批量获取电机错误码。
+        返回: {motor_id: error_status, ...}
+        """
+        if motor_ids is None:
+            motor_ids = self.motor_id_list
+        try:
+            error_statuses = {}
+            commands_by_device = self._group_motors_by_device(motor_ids)
+
+            def task_for_device(dev_idx, m_ids):
+                with self.can_locks[dev_idx]:
+                    for motor_id in m_ids:
+                        error_statuses[motor_id] = self.motors[motor_id].get_error_status()
+
+            with ThreadPoolExecutor(max_workers=len(self.can_handlers) or 1) as executor:
+                futures = [executor.submit(task_for_device, dev_idx, m_ids) for dev_idx, m_ids in commands_by_device.items() if m_ids]
+                for future in futures: future.result()
+            return error_statuses
+        except Exception as e:
+            print(f"\n获取错误码过程中发生错误: {e}")
+            return {}
 
     def set_target_positions(self, target_pose_list, is_check_move=True):
         if len(target_pose_list) != len(self.motor_id_list):
@@ -190,12 +262,13 @@ class ArmController:
             target_pose_map = dict(zip(self.motor_id_list, target_pose_list))
             commands_by_device = self._group_motors_by_device(self.motor_id_list)
 
-            def task_for_device(motor_ids):
-                for motor_id in motor_ids:
-                    self._send_motor_command(motor_id, target_pose_map[motor_id])
+            def task_for_device(dev_idx, motor_ids):
+                with self.can_locks[dev_idx]:
+                    for motor_id in motor_ids:
+                        self._send_motor_command(motor_id, target_pose_map[motor_id])
 
             with ThreadPoolExecutor(max_workers=len(self.can_handlers) or 1) as executor:
-                futures = [executor.submit(task_for_device, m_ids) for _, m_ids in commands_by_device.items() if m_ids]
+                futures = [executor.submit(task_for_device, dev_idx, m_ids) for dev_idx, m_ids in commands_by_device.items() if m_ids]
                 for future in futures: future.result()
 
             if is_check_move:
@@ -219,12 +292,13 @@ class ArmController:
             self.enable_motors(motor_ids_to_move)
             commands_by_device = self._group_motors_by_device(motor_ids_to_move)
 
-            def task_for_device(motor_ids):
-                for motor_id in motor_ids:
-                    self.motors[motor_id].set_target_position(motor_pos_map[motor_id])
+            def task_for_device(dev_idx, motor_ids):
+                with self.can_locks[dev_idx]:
+                    for motor_id in motor_ids:
+                        self.motors[motor_id].set_target_position(motor_pos_map[motor_id])
 
             with ThreadPoolExecutor(max_workers=len(self.can_handlers) or 1) as executor:
-                futures = [executor.submit(task_for_device, m_ids) for _, m_ids in commands_by_device.items() if m_ids]
+                futures = [executor.submit(task_for_device, dev_idx, m_ids) for dev_idx, m_ids in commands_by_device.items() if m_ids]
                 for future in futures: future.result()
 
             print(f"Move commands sent to motors: {motor_ids_to_move}")
@@ -235,16 +309,18 @@ class ArmController:
             print(f"\nAn error occurred during specific motor movement: {e}")
             raise
 
-    def set_async_move(self, commands):
+    def set_async_move(self, commands, is_check_move=True):
         """
         commands: List of tuples (motor_id, command_type, target_position)
         command_type: 'TO' for normal move, 'BRKTO' for brake-on-arrival move
+        is_check_move: If True, wait for motors to stop moving before returning (default: False)
         该函数异步执行多个电机的移动命令，支持普通移动和刹车到位移动。
         1. 启用所有涉及的电机。
         2. 对于'BRKTO'命令，启动监控线程，监测电机位置并在到达目标后停止电机。
         3. 使用线程池并行发送移动命令以提高效率。
         4. 监控线程定期检查电机位置，确保'BRKTO'命令的正确执行。
         5. 提供线程安全的操作，防止数据竞争。
+        6. 如果is_check_move为True，会等待所有电机停止移动后再返回。
 
         """
         motor_ids_involved = [cmd[0] for cmd in commands]
@@ -262,14 +338,14 @@ class ArmController:
         if to_commands:
             commands_by_device = self._group_motors_by_device([cmd[0] for cmd in to_commands])
 
-            def task_for_device(m_ids):
-                for m_id in m_ids:
-                    # Find the corresponding target_pos from the original to_commands list
-                    target_pos = next(cmd[1] for cmd in to_commands if cmd[0] == m_id)
-                    self.motors[m_id].set_target_position(target_pos)
+            def task_for_device(dev_idx, m_ids):
+                with self.can_locks[dev_idx]:
+                    for m_id in m_ids:
+                        target_pos = next(cmd[1] for cmd in to_commands if cmd[0] == m_id)
+                        self.motors[m_id].set_target_position(target_pos)
 
             with ThreadPoolExecutor(max_workers=len(self.can_handlers) or 1) as executor:
-                futures = [executor.submit(task_for_device, m_ids) for _, m_ids in commands_by_device.items() if m_ids]
+                futures = [executor.submit(task_for_device, dev_idx, m_ids) for dev_idx, m_ids in commands_by_device.items() if m_ids]
                 for future in futures: future.result()
 
         with self.monitoring_lock:
@@ -279,6 +355,9 @@ class ArmController:
                 self.monitoring_thread = threading.Thread(target=self._brkto_monitor_worker, daemon=True)
                 self.monitoring_thread.start()
 
+        if is_check_move:
+            self._check_motor_notmove(motor_ids_involved)
+        
     def _brkto_monitor_worker(self):
         """
         Worker thread that monitors motors with BRKTO commands.
@@ -301,13 +380,13 @@ class ArmController:
                 positions = {}
                 commands_by_device = self._group_motors_by_device(monitored_ids)
 
-                def task_for_device(motor_ids):
-                    for motor_id in motor_ids:
-                        positions[motor_id] = self.motors[motor_id].get_current_position()
+                def task_for_device(dev_idx, motor_ids):
+                    with self.can_locks[dev_idx]:
+                        for motor_id in motor_ids:
+                            positions[motor_id] = self.motors[motor_id].get_current_position()
 
                 with ThreadPoolExecutor(max_workers=len(self.can_handlers) or 1) as executor:
-                    futures = [executor.submit(task_for_device, m_ids) for _, m_ids in commands_by_device.items() if
-                               m_ids]
+                    futures = [executor.submit(task_for_device, dev_idx, m_ids) for dev_idx, m_ids in commands_by_device.items() if m_ids]
                     for future in futures: future.result()
 
                 with self.monitoring_lock:
@@ -335,6 +414,12 @@ class ArmController:
             self.monitoring_thread = None
 
     def _check_motor_notmove(self, motor_ids_to_check: list):
+        """
+        该函数检查电机是否停止移动。
+        1. 如果电机停止移动，则返回True。
+        2. 如果电机没有停止移动，则返回False。
+        """
+        
         if not motor_ids_to_check: return
         try:
             print(f"Waiting for motors {motor_ids_to_check} to stop...")
@@ -342,16 +427,24 @@ class ArmController:
             timeout = 30
             all_stopped = False
             while not all_stopped and (time.time() - start_time < timeout):
+                # 如果有BRKTO任务在运行，只等待监控线程完成，避免CAN并发冲突
+                with self.monitoring_lock:
+                    has_brkto = bool(self.brkto_tasks)
+                
+                if has_brkto:
+                    time.sleep(0.1)
+                    continue
+                
                 speeds = {}
                 commands_by_device = self._group_motors_by_device(motor_ids_to_check)
 
-                def task_for_device(motor_ids):
-                    for motor_id in motor_ids:
-                        speeds[motor_id] = self.motors[motor_id].get_current_speed()
+                def task_for_device(dev_idx, motor_ids):
+                    with self.can_locks[dev_idx]:
+                        for motor_id in motor_ids:
+                            speeds[motor_id] = self.motors[motor_id].get_current_speed()
 
                 with ThreadPoolExecutor(max_workers=len(self.can_handlers) or 1) as executor:
-                    futures = [executor.submit(task_for_device, m_ids) for _, m_ids in commands_by_device.items() if
-                               m_ids]
+                    futures = [executor.submit(task_for_device, dev_idx, m_ids) for dev_idx, m_ids in commands_by_device.items() if m_ids]
                     for future in futures: future.result()
 
                 if len(speeds) == len(motor_ids_to_check):
@@ -398,16 +491,17 @@ class ArmController:
             motor_ids = [motor_ids]
 
         try:
-            def task_for_device(m_ids):
-                for motor_id in m_ids:
-                    if motor_id in self.motors:
-                        getattr(self.motors[motor_id], command_func_name)()
-                    else:
-                        print(f"Warning: Motor ID {motor_id} not found.")
+            def task_for_device(dev_idx, m_ids):
+                with self.can_locks[dev_idx]:
+                    for motor_id in m_ids:
+                        if motor_id in self.motors:
+                            getattr(self.motors[motor_id], command_func_name)()
+                        else:
+                            print(f"Warning: Motor ID {motor_id} not found.")
 
             commands_by_device = self._group_motors_by_device(motor_ids)
             with ThreadPoolExecutor(max_workers=len(self.can_handlers) or 1) as executor:
-                futures = [executor.submit(task_for_device, m_ids) for _, m_ids in commands_by_device.items() if m_ids]
+                futures = [executor.submit(task_for_device, dev_idx, m_ids) for dev_idx, m_ids in commands_by_device.items() if m_ids]
                 for future in futures: future.result()
         except Exception as e:
             print(f"Error executing '{command_func_name}' on motors {motor_ids}: {e}")

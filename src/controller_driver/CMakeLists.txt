@@ -9,6 +9,8 @@ project(controller_driver)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
   actionlib
+  control_msgs
+  diagnostic_msgs
   roscpp
   rosmsg
   rospy
@@ -162,9 +164,8 @@ include_directories(
 ## Mark executable scripts (Python etc.) for installation
 ## in contrast to setup.py, you can choose the destination
 catkin_install_python(PROGRAMS
+
   scripts/multi_action_server.py
-  scripts/scan_can_server.py
-  scripts/moveit_action_server.py
   scripts/http_to_plan.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

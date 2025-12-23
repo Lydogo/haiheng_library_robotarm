@@ -46,33 +46,22 @@ class MotorController:
         frame = self._create_frame(full_data)
         self.can.send(frame)
 
-    def _read_command(self, cmd_code: int, timeout: float = 0.5) -> Optional[bytes]:
+    def _read_command(self, cmd_code: int, timeout: float = 0.2) -> Optional[bytes]:
         """
         发送一个读取指令，并等待电机返回相应的数据。
         :param cmd_code: 要发送的指令功能码。
         :param timeout: 等待响应的超时时间（秒）。
         :return: 电机返回的数据部分 (不包含指令码)，超时或失败则返回None。
         """
-        # 清空接收缓冲区 (可选，但推荐)
-        while self.can.receive(wait_time_ms=0):
-            pass
-
-        # 发送读取请求
         self._send_command(cmd_code)
-        # time.sleep(1.0)
         start_time = time.time()
         while time.time() - start_time < timeout:
-            frames = self.can.receive()
-            # print(f"read command raw frames: {frames}")
+            frames = self.can.receive(wait_time_ms=5)
             if frames:
                 for frame in frames:
-                    # 检查是否是来自目标电机的响应，并且响应的是我们发送的指令
                     if frame.ID == self.motor_id and frame.Data[0] == cmd_code:
                         response_data = bytes(frame.Data[1:frame.DataLen])
                         return response_data
-            time.sleep(0.01)  # 短暂休眠，避免CPU占用过高
-
-        print(f"Warning: Timed out waiting for response to command 0x{cmd_code:02X}")
         return None
 
     # --- 电机控制指令 ---
@@ -112,6 +101,15 @@ class MotorController:
         """进入位置模式，并设置目标位置 (指令码 30, 0x1E)"""
         data = struct.pack('<i', position_cnt)  # '<i' 表示小端序有符号4字节整数
         self._send_command(30, data)
+
+    def set_target_position_with_speed(self, position_cnt: int, speed_001hz: int):
+        """
+        前馈速度位置模式 (七字节指令, 指令码 0x11)
+        格式: 1字节指令码 + 4字节位置(cnt) + 2字节速度前馈(0.01Hz)
+        """
+        speed_001hz = max(-32768, min(32767, speed_001hz))
+        data = struct.pack('<ih', position_cnt, speed_001hz)
+        self._send_command(0x11, data)
 
     def set_target_speed(self, speed_001hz: int):
         """进入速度模式，并设置目标速度 (指令码 29, 0x1D)"""
@@ -177,35 +175,64 @@ class MotorController:
         return None
 
     def get_working_mode(self) -> Optional[int]:
-        """获取当前速度 (指令码 3, 0x03)"""
+        """获取当前工作模式 (指令码 3, 0x03)"""
         response = self._read_command(3)
         if response and len(response) == 4:
             return struct.unpack('<i', response)[0]
         return None
 
-    def get_all_states(self) -> Optional[Dict[str, int]]:
+    def get_reduction_ratio(self) -> Optional[int]:
         """
-        一次性获取电流、速度、位置 (指令码 65, 0x41)
-        返回: 8字节组合数据 (2字节电流mA + 2字节速度0.01Hz + 4字节位置cnt)
+        获取电机减速比 (六字节指令, 0x41 0x40)
+        发送: 41 40 00 00 00 00
+        回复: 41 40 XX XX XX XX (后4字节为减速比，小端序)
         """
-        # 这个指令的返回数据不包含指令码本身，直接是8字节数据
-        self._send_command(65)  # 发送读取请求
+        while self.can.receive(wait_time_ms=0):
+            pass
+        
+        data = bytes([0x40, 0x00, 0x00, 0x00, 0x00])
+        self._send_command(0x41, data)
+        
         start_time = time.time()
         while time.time() - start_time < 0.5:
             frames = self.can.receive()
             if frames:
                 for frame in frames:
-                    # 这里假设返回ID相同，且数据长度为8
+                    # 响应格式: 41 40 XX XX XX XX (6字节)
+                    if frame.ID == self.motor_id and frame.DataLen == 6:
+                        response_data = bytes(frame.Data[:6])
+                        # 验证响应头: 0x41 0x40
+                        if response_data[0] == 0x41 and response_data[1] == 0x40:
+                            # 后4字节为减速比 (小端序)
+                            ratio = struct.unpack('<I', response_data[2:6])[0]
+                            # 合理性检查: 减速比应为 51/81/101/121
+                            if ratio in [51, 81, 101, 121]:
+                                return ratio
+                            else:
+                                print(f"Warning: Motor {self.motor_id} unexpected ratio {ratio}")
+                                return None
+            time.sleep(0.01)
+        print(f"Warning: Timed out waiting for reduction ratio from motor {self.motor_id}")
+        return None
+
+    def get_all_states(self, timeout: float = 0.2) -> Optional[Dict[str, int]]:
+        """
+        一次性获取电流、速度、位置 (指令码 65, 0x41)
+        返回: 8字节组合数据 (2字节电流mA + 2字节速度0.01Hz + 4字节位置cnt)
+        """
+        self._send_command(65)
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            frames = self.can.receive(wait_time_ms=5)
+            if frames:
+                for frame in frames:
                     if frame.ID == self.motor_id and frame.DataLen == 8:
                         data = bytes(frame.Data[:8])
                         try:
-                            # '<h' -> 小端序2字节有符号整数, '<i' -> 小端序4字节有符号整数
                             current, speed, position = struct.unpack('<hhi', data)
                             return {"current_ma": current, "speed_001hz": speed, "position_cnt": position}
                         except struct.error:
                             return None
-            time.sleep(0.01)
-        print("Warning: Timed out waiting for combined state response (cmd 0x41)")
         return None
 
     # --- 复合功能指令 ---

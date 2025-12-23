@@ -17,22 +17,22 @@
     </group>
     <!--GROUP STATES: Purpose: Define a named state for a particular group, in terms of joint values. This is useful to define states like 'folded arms'-->
     <group_state name="R_START_POSE" group="Right_arm">
-        <joint name="R_ELBOW_Y" value="0"/>
-        <joint name="R_SHOULDER_P" value="0"/>
-        <joint name="R_SHOULDER_R" value="0"/>
-        <joint name="R_SHOULDER_Y" value="0"/>
-        <joint name="R_WRIST_P" value="0"/>
-        <joint name="R_WRIST_R" value="0"/>
-        <joint name="R_WRIST_Y" value="0"/>
+        <joint name="R_ELBOW_Y" value="-0.13304886489926865"/>
+        <joint name="R_SHOULDER_P" value="-0.32352613554500603"/>
+        <joint name="R_SHOULDER_R" value="1.4509061408417094"/>
+        <joint name="R_SHOULDER_Y" value="-1.6392262510044826"/>
+        <joint name="R_WRIST_P" value="3.1469855547972037"/>
+        <joint name="R_WRIST_R" value="0.7272267357068475"/>
+        <joint name="R_WRIST_Y" value="-0.04565989688940854"/>
     </group_state>
     <group_state name="L_START_POSE" group="Left_arm">
-        <joint name="L_ELBOW_Y" value="0"/>
-        <joint name="L_SHOULDER_P" value="0"/>
-        <joint name="L_SHOULDER_R" value="0"/>
-        <joint name="L_SHOULDER_Y" value="0"/>
-        <joint name="L_WRIST_P" value="0"/>
-        <joint name="L_WRIST_R" value="0"/>
-        <joint name="L_WRIST_Y" value="0"/>
+        <joint name="L_ELBOW_Y" value="-0.06078398871996853"/>
+        <joint name="L_SHOULDER_P" value="0.08300274169449962"/>
+        <joint name="L_SHOULDER_R" value="-1.5114264766137602"/>
+        <joint name="L_SHOULDER_Y" value="-0.1511690129561678"/>
+        <joint name="L_WRIST_P" value="-0.0550794976650188"/>
+        <joint name="L_WRIST_R" value="0.04237621926534084"/>
+        <joint name="L_WRIST_Y" value="-0.02562227284765235"/>
     </group_state>
     <!--VIRTUAL JOINT: Purpose: this element defines a virtual joint between a robot link and an external frame of reference (considered fixed with respect to the robot)-->
     <virtual_joint name="virtual_joint" type="fixed" parent_frame="world" child_link="BASE_S"/>

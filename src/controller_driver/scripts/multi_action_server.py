@@ -36,6 +36,7 @@ from motor_driver_pkg.arm_ctrl import ArmController   # 含多电机并行控制
 # ============================================================
 #                MultiArmMoveItActionServer 主类
 # ============================================================
+fw_fb = 1.0
 
 class MultiArmMoveItActionServer:
     def __init__(self):
@@ -50,7 +51,7 @@ class MultiArmMoveItActionServer:
         self.monitor_rate_hz = rospy.get_param("~monitor_rate", 1)
 
         # ───────────── 初始化 ArmController 实例 ─────────────
-        #TODO 初始化一个实例就够了，把要控制的arm都放在这个实例里控制
+        # 初始化一个实例就够了，把要控制的arm都放在这个实例里控制
 
         self.arm=ArmController(side_names=self.arm_names, config_file=self.config_file)
         self.waist_break_on_arrival()  # 初始化时让腰部电机进入制动状态
@@ -60,7 +61,9 @@ class MultiArmMoveItActionServer:
         self.current_positions = {}
         self.current_velocities = {}
         self.error_flag = False
-        #线程锁，这几个值是多线程共享的，state_lock作用是保护这些共享变量的读写安全
+        self.legs_moving = False  # 腿部移动期间锁住机械臂
+        self.arms_executing = set()  # 正在执行轨迹的机械臂名称集合
+        self.arms_lock = threading.Lock()  # 保护 arms_executing 的锁
 
         # ───────────── ROS 通信接口 ─────────────
         self.joint_state_pub = rospy.Publisher("/joint_states", JointState, queue_size=10)
@@ -97,8 +100,8 @@ class MultiArmMoveItActionServer:
 
         # ───────────── 启动后台线程 ────────────
         threading.Thread(target=self._joint_state_publisher, daemon=True).start()
-        #self._joint_state_publisher()  # 主线程运行 Joint State 发布函数
-        # threading.Thread(target=self._monitor_worker, daemon=True).start()
+        # 电机监控已整合到_joint_state_publisher中，每monitor_interval个周期执行一次诊断
+        self.monitor_interval = max(1, int(self.publish_rate_hz / self.monitor_rate_hz))
 
 
         rospy.loginfo("[SYSTEM] Multi-Arm MoveIt Action Server running.")
@@ -116,27 +119,55 @@ class MultiArmMoveItActionServer:
         if motor_ids is not None:
             self.arm.motors[14].set_target_position(0) #让WAIST_Y回到0位置
             commands = [(motor_id,'BRKTO',0) for motor_id in motor_ids]
-            self.arm.set_async_move(commands)
+            self.arm.set_async_move(commands, is_check_move=False)
+
+    def _any_arm_executing(self):
+        """检查是否有任何机械臂正在执行轨迹"""
+        with self.arms_lock:
+            return len(self.arms_executing) > 0
 
     def legs_break_on_arrival_cb(self,goal):
         """
         腿部电机的server回调服务，传入动作参数
         """
         print("Received leg move goal:", goal.target_positions)
+        
+        # 机械臂运动期间拒绝腿部请求
+        if self._any_arm_executing():
+            rospy.logwarn(f"[LEGS ACTION] Rejected: arms are moving, legs locked.")
+            res = LegMoveResult()
+            res.success = False
+            res.message = "Arms are moving, legs locked."
+            self.legs_action_server.set_aborted(res)
+            return
+        
+        self.legs_moving = True
         try:
-            with self.state_lock:
+            motor_ids= self.arm.ARM_CONFIG["legs"]["motor_ids"]
+            if motor_ids is not None:
+                commands = [(motor_id,'BRKTO',goal.target_positions[i]) for motor_id,i in zip(motor_ids,range(len(motor_ids)))]
+                self.arm.set_async_move(commands, is_check_move=False)
 
-                motor_ids= self.arm.ARM_CONFIG["legs"]["motor_ids"]
-                if motor_ids is not None:
-                    commands = [(motor_id,'BRKTO',goal.target_positions[i]) for motor_id,i in zip(motor_ids,range(len(motor_ids)))]
-                    self.arm.set_async_move(commands)
         except Exception as e:
+            self.legs_moving = False
             rospy.logerr(f"[LEGS ACTION] Failed to send leg positions: {e}")
             res=LegMoveResult()
             res.success=False
             res.message=str(e)
             self.legs_action_server.set_aborted(res)
             return
+        
+        # 等待BRKTO监控线程完成所有任务后再返回
+        import time
+        timeout = 60
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            with self.arm.monitoring_lock:
+                if not self.arm.brkto_tasks:
+                    break
+            time.sleep(0.2)
+        
+        self.legs_moving = False
         res=LegMoveResult()
         res.success=True
         res.message="Legs moved successfully."
@@ -181,17 +212,31 @@ class MultiArmMoveItActionServer:
 
 
 
-    # TODO: 根据motor_id_list与joint_names的对应关系，按照joint_state信息示例的顺序和名称来发布话题。
+    # 根据motor_id_list与joint_names的对应关系，按照joint_state信息示例的顺序和名称来发布话题。
     def _joint_state_publisher(self):
         rate = rospy.Rate(self.publish_rate_hz)
+        cached_states = None
+        cycle_count = 0
         while not rospy.is_shutdown():
-            #state_lock保护current_positions的读写
             with self.state_lock:
-
-                motor_positions = self.arm.get_target_positions()###get到的positions是按照self.arm.motor_id_list顺序的###
-                #如果返回了有None的列表或者列表长度不对，就跳过发布
+                with self.arm.monitoring_lock:
+                    has_brkto = bool(self.arm.brkto_tasks)
+                
+                if has_brkto and cached_states is not None:
+                    states = cached_states
+                else:
+                    states = self.arm.get_all_motor_states()
+                    if states and len(states) == len(self.arm.motor_id_list):
+                        cached_states = states
+                
+                # 从states提取位置
+                motor_positions = []
+                for motor_id in self.arm.motor_id_list:
+                    state = states.get(motor_id) if states else None
+                    motor_positions.append(state.get('position_cnt') if state else None)
+                
                 if None in motor_positions or len(motor_positions) != len(self.arm.joint_names_list):
-                    rospy.logwarn(f"[JOINT STATE] Invalid motor positions read: {motor_positions}")
+                    rospy.logwarn(f"[JOINT STATE] Invalid motor states read")
                     rate.sleep()
                     continue
 
@@ -200,28 +245,38 @@ class MultiArmMoveItActionServer:
                 msg.name = self.arm.joint_names_list
                 msg.position = [self._cnt_to_rad(p) for p in motor_positions]
                 msg.velocity = [0.0] * len(msg.name)
-                self.current_positions = dict(zip(msg.name,msg.position))###注意这里current_positions是一个字典，joint_name: position_rad###
+                self.current_positions = dict(zip(msg.name, msg.position))
 
             self.joint_state_pub.publish(msg)
+            
+            # 周期性监控电流和错误码
+            cycle_count += 1
+            if cycle_count >= self.monitor_interval and not has_brkto and states:
+                cycle_count = 0
+                try:
+                    error_statuses = self.arm.get_error_statuses()
+                except Exception as e:
+                    rospy.logwarn(f"[MONITOR] Error status read failed: {e}")
+                    error_statuses = {}
+                
+                for motor_id in self.arm.motor_id_list:
+                    state = states.get(motor_id)
+                    err_status = error_statuses.get(motor_id)
+                    current_ma = state.get('current_ma') if state else None
+                    speed = state.get('speed_001hz') if state else None
+                    position = state.get('position_cnt') if state else None
+                    err_str = f"0x{err_status:08X}" if err_status is not None else "None"
+                    # rospy.loginfo(f"[MONITOR] ID={motor_id}, CURR={current_ma}mA, SPD={speed}, POS={position}, ERR_CODE={err_str}")
+                    #
+                    # if current_ma is not None and abs(current_ma) > self.current_threshold_ma:
+                    #     rospy.logwarn(f"[MONITOR] Motor {motor_id} overcurrent: {current_ma}mA")
+                    if err_status is not None and err_status != 0:
+                        err_msg=f"[MONITOR] Motor {motor_id} error=0x{err_status:08X}"
+                        rospy.logerr(err_msg)
+                        raise Exception(err_msg)
+            
             rate.sleep()
 
-    # ============================================================
-    #                电机监控线程
-    # ============================================================
-    def _monitor_worker(self):
-        rate = rospy.Rate(self.monitor_rate_hz)
-        while not rospy.is_shutdown():
-            for motor_id, motor in self.arm.motors.items():
-                try:
-                    current_ma = motor.get_current_current()
-                    err_status = motor.get_error_status()
-                    if current_ma and abs(current_ma) > self.current_threshold_ma:
-                        self._handle_error(f"{motor_id} overcurrent {current_ma}mA")
-                    if err_status and err_status != 0:
-                        self._handle_error(f"{motor_id} error=0x{err_status:08X}")
-                except Exception as e:
-                    rospy.logwarn(f"[MONITOR]{motor_id} read failed: {e}")
-            rate.sleep()
 
     # ============================================================
     #                Action Server 执行回调
@@ -265,79 +320,107 @@ class MultiArmMoveItActionServer:
     #           secs: 0
     #           nsecs:         0
     # ---
-    # TODO: 根据实际机械臂的关节命名和顺序，调整arm.set_target_positions(point.positions)电机id和goal.trajectory.points关节顺序的对应关系
+    # 根据实际机械臂的关节命名和顺序，调整arm.set_target_positions(point.positions)电机id和goal.trajectory.points关节顺序的对应关系
     def execute_cb(self, goal, arm_name):
         rospy.loginfo(f"[ACTION] Received FollowJointTrajectory goal for {arm_name}.")
         action_server = self.action_servers[arm_name]
 
-        # 1. 基础检查
-        if not goal.trajectory.points:
+        # 0. 腿部移动期间拒绝机械臂请求
+        if self.legs_moving:
+            rospy.logwarn(f"[ACTION] Rejected: legs are moving, arm {arm_name} locked.")
             res = FollowJointTrajectoryResult()
             res.error_code = FollowJointTrajectoryResult.INVALID_GOAL
-            res.error_string = "Empty trajectory."
+            res.error_string = "Legs are moving, arm locked."
             action_server.set_aborted(res)
             return
-        
-        #按照self.config里的joint_names顺序来排列goal.trajectory.points里的positions
-        # joint_name_order = [self.arm.config[arm_name]['joint_names']]
-        # joint_name_order.extend(self.arm.config[arm_name]['joint_names'])
-        # name_to_index = {name: idx for idx, name in enumerate(goal.trajectory.joint_names)}
-        #字典推导 {name: idx for idx, name in ...} 把每个关节名 name 作为键、对应的索引 idx 作为值，生成一个 name -> index 的映射 name_to_index。
 
-        #以上弃用，直接根据self.arm.joint_names_list和self.arm.motor_id_list获取对应电机的motor_id然后直接命令？尝试一下
+        # 标记该机械臂开始执行
+        with self.arms_lock:
+            self.arms_executing.add(arm_name)
 
-        # 2. 按时间执行轨迹
-        start_time = rospy.Time.now()
-        for point_idx, point in enumerate(goal.trajectory.points):
-            if action_server.is_preempt_requested():
-                rospy.logwarn(f"[ACTION] Goal preempted by client for {arm_name}.")
-                self._stop_all()
-                action_server.set_preempted()
+        try:
+            # 1. 基础检查
+            if not goal.trajectory.points:
+                res = FollowJointTrajectoryResult()
+                res.error_code = FollowJointTrajectoryResult.INVALID_GOAL
+                res.error_string = "Empty trajectory."
+                action_server.set_aborted(res)
                 return
 
-            # 等待到达该时间点
-            target_time = start_time + point.time_from_start
-            while rospy.Time.now() < target_time: # and not all(abs(a - d) < 0.01 for a, d in zip(fb.actual.positions, fb.desired.positions)):
-                rospy.sleep(0.1)
-                if self.error_flag:
-                    rospy.logerr(f"[ACTION] Hardware error detected! Abort trajectory for {arm_name}.")
-                    res = FollowJointTrajectoryResult()
-                    res.error_code = FollowJointTrajectoryResult.PATH_TOLERANCE_VIOLATED
-                    res.error_string = "Hardware fault detected"
+            # 2. 按时间执行轨迹
+            start_time = rospy.Time.now()
+            for point_idx, point in enumerate(goal.trajectory.points):
+                if action_server.is_preempt_requested():
+                    rospy.logwarn(f"[ACTION] Goal preempted by client for {arm_name}.")
                     self._stop_all()
-                    action_server.set_aborted(res)
+                    action_server.set_preempted()
                     return
 
-            # 只发送目标到当前机械臂
-            # 没有判断是否到达目标位置，只是简单地发送命令
-            #FIXME: 需要判断是否到达目标位置吗？还是只需要发送命令就行？
-            try:
-                
+                fb = FollowJointTrajectoryFeedback()
+                target_time = start_time + point.time_from_start
+
                 with self.state_lock:
-                    for joint_name, position_rad in zip(goal.trajectory.joint_names, point.positions):
-                        motor_id = self.arm.joint_name_to_motor_id[joint_name]
-                        position_cnt = self._rad_to_cnt(position_rad)
-                        self.arm.motors[motor_id].set_target_position(position_cnt)
-                    fb = FollowJointTrajectoryFeedback()
                     fb.joint_names = goal.trajectory.joint_names
                     fb.actual.positions = [self.current_positions[jn] for jn in goal.trajectory.joint_names]
                     fb.desired.positions = list(point.positions)
                     action_server.publish_feedback(fb)
-                ########## set_target_positions里的电机位置应该与trajectory的goal对应！最好安装ArmController类里YAML设置的motor_idx的顺序来传递##########
-            except Exception as e:
-                rospy.logerr(f"[ACTION] Failed to send positions for {arm_name}: {e}")
-                res = FollowJointTrajectoryResult()
-                res.error_code = FollowJointTrajectoryResult.GOAL_TOLERANCE_VIOLATED
-                res.error_string = str(e)
-                action_server.set_aborted(res)
-                return arm_name
+                if all(abs(a - d) < 0.02 for a, d in zip(fb.actual.positions, fb.desired.positions)):
+                    continue
 
+                while rospy.Time.now() < target_time and all(abs(a - d) < 0.02 for a, d in zip(fb.actual.positions, fb.desired.positions)):
+                    rospy.sleep(0.1)
+                    if self.error_flag:
+                        rospy.logerr(f"[ACTION] Hardware error detected! Abort trajectory for {arm_name}.")
+                        res = FollowJointTrajectoryResult()
+                        res.error_code = FollowJointTrajectoryResult.PATH_TOLERANCE_VIOLATED
+                        res.error_string = "Hardware fault detected"
+                        self._stop_all()
+                        action_server.set_aborted(res)
+                        return
 
-        # 3. 执行完毕
-        res = FollowJointTrajectoryResult()
-        res.error_code = FollowJointTrajectoryResult.SUCCESSFUL
-        action_server.set_succeeded(res)
-        rospy.loginfo(f"[ACTION] Trajectory execution completed successfully for {arm_name}.")
+                try:
+                    with self.state_lock:
+                        velocities = list(point.velocities) if point.velocities else [0.0] * len(point.positions)
+                        
+                        motor_commands = []
+                        for joint_name, position_rad, velocity_rad_s in zip(
+                            goal.trajectory.joint_names, point.positions, velocities
+                        ):
+                            motor_id = self.arm.joint_name_to_motor_id[joint_name]
+                            position_cnt = self._rad_to_cnt(position_rad)
+                            reduction_ratio = self.arm.motor_reduction_ratios.get(motor_id, 101)
+                            speed_001hz = int(fw_fb * self._rad_per_sec_to_speed_001hz(velocity_rad_s, reduction_ratio))
+                            motor_commands.append((motor_id, position_cnt, speed_001hz))
+                        
+                        commands_by_device = self.arm._group_motors_by_device([cmd[0] for cmd in motor_commands])
+                        cmd_map = {cmd[0]: (cmd[1], cmd[2]) for cmd in motor_commands}
+                        for dev_idx, motor_ids in commands_by_device.items():
+                            if motor_ids:
+                                with self.arm.can_locks[dev_idx]:
+                                    for motor_id in motor_ids:
+                                        pos, spd = cmd_map[motor_id]
+                                        self.arm.motors[motor_id].set_target_position_with_speed(pos, spd)
+                        
+                        fb.actual.positions = [self.current_positions[jn] for jn in goal.trajectory.joint_names]
+                        fb.desired.positions = list(point.positions)
+                        action_server.publish_feedback(fb)
+                except Exception as e:
+                    rospy.logerr(f"[ACTION] Failed to send positions for {arm_name}: {e}")
+                    res = FollowJointTrajectoryResult()
+                    res.error_code = FollowJointTrajectoryResult.GOAL_TOLERANCE_VIOLATED
+                    res.error_string = str(e)
+                    action_server.set_aborted(res)
+                    return
+
+            # 3. 执行完毕
+            res = FollowJointTrajectoryResult()
+            res.error_code = FollowJointTrajectoryResult.SUCCESSFUL
+            action_server.set_succeeded(res)
+            rospy.loginfo(f"[ACTION] Trajectory execution completed successfully for {arm_name}.")
+        finally:
+            # 清除该机械臂的执行标记
+            with self.arms_lock:
+                self.arms_executing.discard(arm_name)
 
     # ============================================================
     #                辅助函数
@@ -378,6 +461,19 @@ class MultiArmMoveItActionServer:
     @staticmethod
     def _rad_to_cnt(rad):
         return int(rad * 262144/(2*math.pi))
+    
+    @staticmethod
+    def _rad_per_sec_to_speed_001hz(rad_per_sec: float, reduction_ratio: int) -> int:
+        """
+        将关节端速度(rad/s)转换为电机端速度(0.01Hz)
+        rad/s → 输出端RPM → 电机端RPM → 0.01Hz
+        """
+        if rad_per_sec == 0.0:
+            return 0
+        output_rpm = rad_per_sec * 60.0 / (2.0 * math.pi)
+        motor_rpm = output_rpm * reduction_ratio
+        speed_001hz = int(motor_rpm * 100.0 / 60.0)
+        return max(-32768, min(32767, speed_001hz))
 
 # ============================================================
 #                节点入口

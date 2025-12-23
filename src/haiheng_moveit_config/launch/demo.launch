@@ -42,9 +42,10 @@
     <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" respawn="true" output="screen" />
   </group>
   <group if="$(eval arg('moveit_controller_manager') == 'simple')">
-    <node name="multi_action_server" pkg="controller_driver" type="multi_action_server.py" output="screen">
+    <!-- multi_action_server publishes /joint_states, must start before move_group -->
+    <node name="multi_action_server" pkg="controller_driver" type="multi_action_server.py" output="screen" respawn="true" respawn_delay="5">
       <param name="config_file" value="$(find controller_driver)/config/arm_bind.yaml" />
-      </node>
+    </node>
     <!-- Given the published joint states, publish tf for the robot links -->
     <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" respawn="true" output="screen"/>
   </group>
@@ -58,6 +59,14 @@
     <arg name="pipeline" value="$(arg pipeline)"/>
     <arg name="load_robot_description" value="$(arg load_robot_description)"/>
   </include>
+
+  <!-- Ensures all MoveIt! related services are available before http_to_plan bridge start-->
+  <group if="$(eval arg('moveit_controller_manager') == 'fake')">
+    <node name="http_moveit_bridge" pkg="controller_driver" type="http_to_plan.py" output="screen" respawn="true" respawn_delay="5"/>
+  </group>
+  <group if="$(eval arg('moveit_controller_manager') == 'simple')">
+    <node name="http_moveit_bridge" pkg="controller_driver" type="http_to_plan.py" output="screen" respawn="true" respawn_delay="5"/>
+  </group>
 
   <!-- Run Rviz and load the default config to see the state of the move_group node -->
   <include file="$(dirname)/moveit_rviz.launch" if="$(arg use_rviz)">

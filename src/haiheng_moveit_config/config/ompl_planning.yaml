@@ -195,7 +195,7 @@ Right_arm:
     - ABITstar
     - BITstar
   projection_evaluator: joints(R_SHOULDER_P,R_SHOULDER_R)
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.001
 Left_arm:
   default_planner_config: RRT
   planner_configs:
@@ -227,4 +227,4 @@ Left_arm:
     - ABITstar
     - BITstar
   projection_evaluator: joints(L_SHOULDER_P,L_SHOULDER_R)
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.001
