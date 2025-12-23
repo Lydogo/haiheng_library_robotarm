@@ -1,8 +1,0 @@
-prefix=/root/haiheng2_ws/devel
-
-Name: haiheng_moveit_config
-Description: Description of haiheng_moveit_config
-Version: 0.3.0
-Cflags: 
-Libs: -L${prefix}/lib 
-Requires: 
